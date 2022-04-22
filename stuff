@@ -1,72 +1,84 @@
 /********************************************************
- * PID RelayOutput Example
- * Same as basic example, except that this time, the output
- * is going to a digital pin which (we presume) is controlling
- * a relay.  the pid is designed to Output an analog value,
- * but the relay can only be On/Off.
- *
- *   to connect them together we use "time proportioning
- * control"  it's essentially a really slow version of PWM.
- * first we decide on a window size (5000mS say.) we then
- * set the pid to adjust its output between 0 and that window
- * size.  lastly, we add some logic that translates the PID
- * output into "Relay On Time" with the remainder of the
- * window being "Relay Off Time"
+   PID RelayOutput Example
+   Same as basic example, except that this time, the output
+   is going to a digital pin which (we presume) is controlling
+   a relay.  the pid is designed to Output an analog value,
+   but the relay can only be On/Off.
+
+     to connect them together we use "time proportioning
+   control"  it's essentially a really slow version of PWM.
+   first we decide on a window size (5000mS say.) we then
+   set the pid to adjust its output between 0 and that window
+   size.  lastly, we add some logic that translates the PID
+   output into "Relay On Time" with the remainder of the
+   window being "Relay Off Time"
  ********************************************************/
 // interupt code from all about circuits "Using Interupts on Arduino"
 
- 
-// Include the PID library 
+
+// Include the PID library
 #include <PID_v1.h>
 
 // Include the Libraries for the DS18B20 temperature sensors and the OneWire bus
 #include <DallasTemperature.h>
 #include <OneWire.h>
 
-// DS18B20 Data wires are plugged into pin 48 on the Arduino 
-#define ONE_WIRE_BUS 48  
+// DS18B20 Data wires are plugged into pin 48 on the Arduino
+#define ONE_WIRE_BUS 46
 
-// Setup a oneWire instance to communicate with any OneWire devices  
-OneWire oneWire(ONE_WIRE_BUS); 
+// Setup a oneWire instance to communicate with any OneWire devices
+OneWire oneWire(ONE_WIRE_BUS);
 
-// Pass our oneWire reference to Dallas Temperature. 
+// Pass our oneWire reference to Dallas Temperature.
 DallasTemperature sensors(&oneWire);
+double boxTemp = 0;
+double tankTemp = 0;
 
 //Define the digital out pin for the relay controlling the AC water heater
+#define tankHeater 52
 #define boxHeater 53
 
 //Define honey valve pin
-#define valve 50
+#define valve 48
 
 //Define mixer motor pins
 const int E1 = 3; ///<Motor1 Speed
 const int M1 = 4; ///<Motor1 Direction
 
 //Define mixer motor setpoint
+int motorVal = digitalRead(M1);
 int mixerRPM = 165;
 
 //Define Safety Button variables
-const int safetyButton = 2; //limit switch connected to digital pin 52
+const int safetyButton = 50; //limit switch connected to digital pin 52
 const int ledPin = 13; //built in led port
 
 //Saftey button state, "volatile" int is a variable value that "...is not entirely within a program's control." i.e. User input
-volatile int safetyButtonState = 0; //variable for reading the limit button status
+volatile int safetyButtonState = 1; //variable for reading the limit button status
 
 //Define Variables we'll be connecting to
 double Setpoint, Input, Output;
 
 //Specify the links and initial tuning parameters
-double Kp=500, Ki=20, Kd=1;
+double Kp = 1000, Ki = 200, Kd = 0.5;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
 int WindowSize = 5000;
 unsigned long windowStartTime;
 
+unsigned long currentMillis = 0;
+unsigned long whenBobIsTrue = 0;
+int bob = 0;
+unsigned long valveReleaseDelay = 0;
+
+
+
 void setup()
 {
   Serial.begin(115200);
   windowStartTime = millis();
-  pinMode(boxHeater,OUTPUT);
+
+  pinMode(tankHeater, OUTPUT);
 
   //initialize the LED pin as an output
   pinMode(ledPin, OUTPUT);
@@ -75,14 +87,17 @@ void setup()
   pinMode(safetyButton, INPUT);
 
   //initialize the valve pin as an output
-  pinMode(valve,OUTPUT);
+  pinMode(valve, OUTPUT);
 
   //initialise the motor pins as outputs
-  pinMode(E1,OUTPUT);
-  pinMode(M1,OUTPUT);
+  pinMode(E1, OUTPUT);
+  pinMode(M1, OUTPUT);
+
+  //set valve release delay in ms
+  valveReleaseDelay = 600000;
 
   //initialize the variables we're linked to
-  Setpoint = 18;
+  Setpoint = 35;
 
   //tell the PID to range between 0 and the full window size
   myPID.SetOutputLimits(0, WindowSize);
@@ -93,66 +108,80 @@ void setup()
 
 void loop()
 {
+
   //read the state of the safety button value
   safetyButtonState = digitalRead(safetyButton);
+  if (safetyButtonState == 1) {
+    Serial.println("Please close the lid");
+    Serial.println(safetyButtonState);
+  } else {
 
-  if (safetyButtonState == LOW){
     // Send the command to get temperatures
     sensors.requestTemperatures();
-  
-    Input = sensors.getTempCByIndex(0);
+    boxTemp = sensors.getTempCByIndex(0); //Box Temperature
+    tankTemp = sensors.getTempCByIndex(1);//Tank Temp
+    Input = tankTemp;
     myPID.Compute();
 
     /************************************************
-    * turn the output pin on/off based on pid output
+      turn the output pin on/off based on pid output
     ************************************************/
     if (millis() - windowStartTime > WindowSize)
     { //time to shift the Relay Window
       windowStartTime += WindowSize;
     }
-  
-    if (Input < Setpoint ){
-      digitalWrite(boxHeater,HIGH);
-    }else if (Output > millis() - windowStartTime){ 
-      digitalWrite(boxHeater, HIGH);
-    }else{ 
-      digitalWrite(boxHeater, LOW);
+
+    if (Output > millis() - windowStartTime) {
+      digitalWrite(tankHeater, HIGH);
+    } else {
+      digitalWrite(tankHeater, LOW);
     }
-    
+
     Valve_Open();
     Mixer_Motor(mixerRPM);
-  
-    Serial.print("temperature of Box ");
-    Serial.println(Input);
-    Serial.println(digitalRead(boxHeater));
-    Serial.println(Output);
-    Serial.println(windowStartTime);
-    Serial.println(millis() - windowStartTime);
-    
-  }else{
-    Serial.println("Please close the lid");
 
+    //Serial.print("temperature of Tank: ");
+    Serial.println(Input);
+//    Serial.print("Temperature of Box: ");
+//    Serial.println(boxTemp);
+//    Serial.print("Heater Status: ");
+//    Serial.println(digitalRead(tankHeater));
+//    Serial.print("Current Output: ");
+//    Serial.println(Output);
+//    Serial.print("Window Start Time: ");
+//    Serial.println(windowStartTime);
+//    Serial.print("Current Time - Window Start Time: ");
+//    Serial.println(millis() - windowStartTime);
+//    Serial.print("Status of Bob: ");
+//    Serial.println(bob);
+//    Serial.println(currentMillis - whenBobIsTrue);
+//    Serial.println(whenBobIsTrue);
   }
 }
 
 //Set function to drive motor 1
 void Mixer_Motor(char Speed) ///<Motor1 Advance
 {
-  digitalWrite(M1,LOW);
-  if (Input > Setpoint - 0.1 && Input < Setpoint + 0.1){
-    analogWrite(E1,Speed);
-  }else{
-    analogWrite(E1,50);
+  motorVal = map(motorVal, 20, 100, 50, 255);
+  digitalWrite(M1, LOW);
+  if (Input > Setpoint - 0.1 && Input < Setpoint + 0.1) {
+    analogWrite(E1, Speed);
+  } else {
+    analogWrite(E1, 50);
   }
 }
 
 void Valve_Open()
 {
-    if (Input > Setpoint - 0.1 && Input < Setpoint + 0.1){
-      digitalWrite(valve,HIGH);
-    }else{
-      digitalWrite(valve,LOW);
-    }
+  if (Input < Setpoint - 0.1) bob = 0;
+  if (Input > Setpoint - 0.1 && Input < Setpoint + 0.1 && bob == 0) {
+    bob = 1;
+    whenBobIsTrue = millis();
+  }
+  currentMillis = millis();
+  if (bob && currentMillis - whenBobIsTrue >= valveReleaseDelay) {
+    digitalWrite(valve, HIGH);
+  } else {
+    digitalWrite(valve, LOW);
+  }
 }
-
-
