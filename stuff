@@ -1,23 +1,9 @@
-/********************************************************
-   PID RelayOutput Example
-   Same as basic example, except that this time, the output
-   is going to a digital pin which (we presume) is controlling
-   a relay.  the pid is designed to Output an analog value,
-   but the relay can only be On/Off.
-
-     to connect them together we use "time proportioning
-   control"  it's essentially a really slow version of PWM.
-   first we decide on a window size (5000mS say.) we then
-   set the pid to adjust its output between 0 and that window
-   size.  lastly, we add some logic that translates the PID
-   output into "Relay On Time" with the remainder of the
-   window being "Relay Off Time"
- ********************************************************/
-// interupt code from all about circuits "Using Interupts on Arduino"
-
+// Include the 4D Systems Visi Genie library for the uLCD Touch screen
+#include <genieArduino.h>
 
 // Include the PID library
 #include <PID_v1.h>
+
 
 // Include the Libraries for the DS18B20 temperature sensors and the OneWire bus
 #include <DallasTemperature.h>
@@ -31,8 +17,8 @@ OneWire oneWire(ONE_WIRE_BUS);
 
 // Pass our oneWire reference to Dallas Temperature.
 DallasTemperature sensors(&oneWire);
-double boxTemp = 0;
-double tankTemp = 0;
+double boxTemp;
+double tankTemp;
 
 //Define the digital out pin for the relay controlling the AC water heater
 #define tankHeater 52
@@ -42,46 +28,80 @@ double tankTemp = 0;
 #define valve 48
 
 //Define mixer motor pins
-const int E1 = 3; ///<Motor1 Speed
-const int M1 = 4; ///<Motor1 Direction
+const int E1 = 6; ///<Motor1 Speed
+const int M1 = 7; ///<Motor1 Direction
 
 //Define mixer motor setpoint
-int motorVal = digitalRead(M1);
-int mixerRPM = 165;
+
+int mixerBaseRPM;
+int mixerMixingRPM;
+int mixerCurrentRPM;
 
 //Define Safety Button variables
 const int safetyButton = 50; //limit switch connected to digital pin 52
-const int ledPin = 13; //built in led port
 
 //Saftey button state, "volatile" int is a variable value that "...is not entirely within a program's control." i.e. User input
 volatile int safetyButtonState = 1; //variable for reading the limit button status
 
 //Define Variables we'll be connecting to
-double Setpoint, Input, Output;
+double tankSetpoint, tankInput, tankOutput;
+double boxSetpoint, boxInput, boxOutput;
+
+
 
 //Specify the links and initial tuning parameters
-double Kp = 1000, Ki = 200, Kd = 0.5;
-PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+double tankKp = 4000, tankKi = 0.05, tankKd = 0.2;
+PID tankPID(&tankInput, &tankOutput, &tankSetpoint, tankKp, tankKi, tankKd, DIRECT);
 
-int WindowSize = 5000;
+//Specify the links and initial tuning parameters
+double boxKp = 7000, boxKi = 0.5, boxKd = 0.1;
+PID boxPID(&boxInput, &boxOutput, &boxSetpoint, boxKp, boxKi, boxKd, DIRECT);
+
+//PID Window size
+int WindowSize = 10000;
 unsigned long windowStartTime;
 
-unsigned long currentMillis = 0;
-unsigned long whenBobIsTrue = 0;
-int bob = 0;
-unsigned long valveReleaseDelay = 0;
 
+unsigned long currentMillis = 0;
+unsigned long whenSetpointIsReached = 0;
+int set = 0;
+
+//Valve Release Countdown from when the temperature is at setpoint.
+//Adding a delay gives can be used to account for any oscillations.
+unsigned long valveRelease;
+
+//Initialize the Visi Genie instance
+Genie genie; // Creates a new instance named 'genie'
+#define RESETLINE 4
 
 
 void setup()
 {
-  Serial.begin(115200);
+  // Use a Serial Begin and serial port of your choice in your code and use the 
+  // genie.Begin function to send it to the Genie library (see this example below)
+  Serial.begin(115200);  // Serial0 @ 115200 Baud
+  genie.Begin(Serial);   // Use Serial0 for talking to the Genie Library, and to the 4D Systems display
+
+  //genie.AttachEventHandler(myGenieEventHandler); // Attach the user function Event Handler for processing events
+
+  // Reset the Display
+  // THIS IS IMPORTANT AND CAN PREVENT OUT OF SYNC ISSUES, SLOW SPEED RESPONSE ETC
+  pinMode(RESETLINE, OUTPUT);  // Set D4 on Arduino to Output (4D Arduino Adaptor V2 - Display Reset)
+  digitalWrite(RESETLINE, 1);  // Reset the Display via D4
+  delay(100);
+  digitalWrite(RESETLINE, 0);  // unReset the Display via D4
+  
+ // Let the display start up after the reset (This is important)
+  // Increase to 4500 or 5000 if you have sync problems as your project gets larger. Can depent on microSD init speed.
+  delay (3500); 
+  
+  genie.WriteObject(GENIE_OBJ_FORM, 1, 0);
+
   windowStartTime = millis();
 
   pinMode(tankHeater, OUTPUT);
+  pinMode(boxHeater, OUTPUT);
 
-  //initialize the LED pin as an output
-  pinMode(ledPin, OUTPUT);
 
   //initialize the safety button as an input
   pinMode(safetyButton, INPUT);
@@ -93,95 +113,128 @@ void setup()
   pinMode(E1, OUTPUT);
   pinMode(M1, OUTPUT);
 
-  //set valve release delay in ms
-  valveReleaseDelay = 600000;
 
-  //initialize the variables we're linked to
-  Setpoint = 35;
+  //set valve release delay in ms
+  valveRelease = 6000;
 
   //tell the PID to range between 0 and the full window size
-  myPID.SetOutputLimits(0, WindowSize);
+  tankPID.SetOutputLimits(0, WindowSize);
+  boxPID.SetOutputLimits(0, WindowSize);
 
   //turn the PID on
-  myPID.SetMode(AUTOMATIC);
+  tankPID.SetMode(AUTOMATIC);
+  boxPID.SetMode(AUTOMATIC);
+
 }
 
 void loop()
 {
 
-  //read the state of the safety button value
-  safetyButtonState = digitalRead(safetyButton);
-  if (safetyButtonState == 1) {
-    Serial.println("Please close the lid");
-    Serial.println(safetyButtonState);
-  } else {
+  
+  Valve_Open();
+  Mixer_Motor();
 
-    // Send the command to get temperatures
-    sensors.requestTemperatures();
-    boxTemp = sensors.getTempCByIndex(0); //Box Temperature
-    tankTemp = sensors.getTempCByIndex(1);//Tank Temp
-    Input = tankTemp;
-    myPID.Compute();
-
-    /************************************************
-      turn the output pin on/off based on pid output
-    ************************************************/
-    if (millis() - windowStartTime > WindowSize)
-    { //time to shift the Relay Window
-      windowStartTime += WindowSize;
-    }
-
-    if (Output > millis() - windowStartTime) {
-      digitalWrite(tankHeater, HIGH);
-    } else {
-      digitalWrite(tankHeater, LOW);
-    }
-
-    Valve_Open();
-    Mixer_Motor(mixerRPM);
-
-    //Serial.print("temperature of Tank: ");
-    Serial.println(Input);
-//    Serial.print("Temperature of Box: ");
-//    Serial.println(boxTemp);
-//    Serial.print("Heater Status: ");
-//    Serial.println(digitalRead(tankHeater));
-//    Serial.print("Current Output: ");
-//    Serial.println(Output);
-//    Serial.print("Window Start Time: ");
-//    Serial.println(windowStartTime);
-//    Serial.print("Current Time - Window Start Time: ");
-//    Serial.println(millis() - windowStartTime);
-//    Serial.print("Status of Bob: ");
-//    Serial.println(bob);
-//    Serial.println(currentMillis - whenBobIsTrue);
-//    Serial.println(whenBobIsTrue);
+  genie.DoEvents(); // This calls the library each loop to process the queued responses from the display
+  
+  static long waitPeriod = millis();
+  if (millis() >= waitPeriod)
+  {
+    //update the display
+    //Write TO on-screen objects from global variables
+    genie.WriteObject(GENIE_OBJ_ILED_DIGITS, 1, (tankTemp * 100));
+    genie.WriteObject(GENIE_OBJ_ILED_DIGITS, 2, (boxTemp * 100));
+    genie.WriteObject(GENIE_OBJ_ILED_DIGITS, 4, tankSetpoint);
+    
+    // Sets ILedDigits1 to boxTemp as a Double Variable
+    waitPeriod = millis() + 100;
   }
+
+
+  // Send the command to get temperatures
+  sensors.requestTemperatures();
+  boxTemp = sensors.getTempCByIndex(0); //Box Temperature
+  boxInput = boxTemp;
+  tankTemp = sensors.getTempCByIndex(1);//Tank Temp
+  tankInput = tankTemp;
+  
+  tankPID.Compute();
+  boxPID.Compute();
+
+  /************************************************
+    turn the output pin on/off based on pid output
+  ************************************************/
+  if (millis() - windowStartTime > WindowSize)
+  { //time to shift the Relay Window
+    windowStartTime += WindowSize;
+  }
+
+  if (tankOutput > millis() - windowStartTime) {
+    digitalWrite(tankHeater, HIGH);
+  } else {
+    digitalWrite(tankHeater, LOW);
+  }
+
+  if (boxOutput > millis() - windowStartTime) {
+    digitalWrite(boxHeater, HIGH);
+  } else {
+    digitalWrite(boxHeater, LOW);
+  }
+
 }
 
 //Set function to drive motor 1
-void Mixer_Motor(char Speed) ///<Motor1 Advance
+void Mixer_Motor() //<Motor1 Advance
 {
-  motorVal = map(motorVal, 20, 100, 50, 255);
+  // motorVal = map(motorVal, 20, 100, 50, 255);
   digitalWrite(M1, LOW);
-  if (Input > Setpoint - 0.1 && Input < Setpoint + 0.1) {
-    analogWrite(E1, Speed);
+  if (tankInput > tankSetpoint - 0.1 && tankInput < tankSetpoint + 0.1) {
+    analogWrite(E1, 165);
+    mixerCurrentRPM = mixerMixingRPM;
   } else {
     analogWrite(E1, 50);
+    mixerCurrentRPM = mixerBaseRPM;
   }
 }
 
 void Valve_Open()
 {
-  if (Input < Setpoint - 0.1) bob = 0;
-  if (Input > Setpoint - 0.1 && Input < Setpoint + 0.1 && bob == 0) {
-    bob = 1;
-    whenBobIsTrue = millis();
+  int valveState = 0;
+  if (valveState = 0)
+  {
+    if (tankInput < tankSetpoint - 0.05) set = 0;
+    if (tankInput > tankSetpoint - 0.05 && set == 1) {
+      set = 1;
+      whenSetpointIsReached = millis();
+    }
+    currentMillis = millis();
+    if (set && currentMillis - whenSetpointIsReached >= valveRelease) {
+      digitalWrite(valve, HIGH);
+      valveState = 1;
+    } else {
+      digitalWrite(valve, LOW);
+    }
   }
-  currentMillis = millis();
-  if (bob && currentMillis - whenBobIsTrue >= valveReleaseDelay) {
-    digitalWrite(valve, HIGH);
-  } else {
-    digitalWrite(valve, LOW);
+}
+
+void myGenieEventHandler(void)
+{
+  genieFrame Event;
+  genie.DequeueEvent(&Event);
+  int tankControl = 30;
+  int boxControl = 20;
+
+  //Filter Events from ISliderG1 (Index = 1) for a Reported Message from Display
+  if (genie.EventIs(&Event, GENIE_REPORT_EVENT, GENIE_OBJ_ISLIDERG, 1))
+  {
+    tankSetpoint = genie.GetEventData(&Event);  // Receive the event data from the Slider0
+    genie.WriteObject(GENIE_OBJ_ILED_DIGITS, 3, tankSetpoint);     // Write Slider0 value to LED Digits 0
   }
+
+    //Filter Events from ISliderG2 (Index = 2) for a Reported Message from Display
+  if (genie.EventIs(&Event, GENIE_REPORT_EVENT, GENIE_OBJ_ISLIDERG, 2))
+  {
+    boxSetpoint = genie.GetEventData(&Event);  // Receive the event data from the Slider0
+    genie.WriteObject(GENIE_OBJ_ILED_DIGITS, 4, boxSetpoint); // Write Slider0 value to LED Digits 0
+
+  } 
 }
